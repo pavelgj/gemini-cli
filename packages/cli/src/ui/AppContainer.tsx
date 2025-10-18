@@ -91,6 +91,8 @@ import { useSessionStats } from './contexts/SessionContext.js';
 import { useGitBranchName } from './hooks/useGitBranchName.js';
 import { useExtensionUpdates } from './hooks/useExtensionUpdates.js';
 import { ShellFocusContext } from './contexts/ShellFocusContext.js';
+import { getGenkitInstance } from '@google/gemini-cli-core/src/telemetry/sdk.js';
+import z from 'zod';
 
 const CTRL_EXIT_PROMPT_DURATION_MS = 1000;
 const QUEUE_ERROR_DISPLAY_DURATION_MS = 3000;
@@ -119,6 +121,14 @@ interface AppContainerProps {
  * This provides horizontal padding.
  */
 const SHELL_WIDTH_FRACTION = 0.89;
+
+let __addMessage: (msg: string)=>void;
+
+getGenkitInstance()?.defineFlow({name: 'addMessage', inputSchema: z.string()}, async (msg) => {
+  if (__addMessage) {
+    __addMessage(msg);
+  }
+});
 
 /**
  * The number of lines to subtract from the available terminal height
@@ -633,6 +643,8 @@ Logging in with Google... Please restart Gemini CLI to continue.
     submitQuery,
   });
 
+  __addMessage = addMessage;
+
   cancelHandlerRef.current = useCallback(() => {
     const pendingHistoryItems = [
       ...pendingSlashCommandHistoryItems,
@@ -670,6 +682,7 @@ Logging in with Google... Please restart Gemini CLI to continue.
     },
     [addMessage],
   );
+  __addMessage = handleFinalSubmit;
 
   const handleClearScreen = useCallback(() => {
     historyManager.clearItems();

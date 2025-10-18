@@ -52,6 +52,7 @@ import type { IdeContext, File } from '../ide/types.js';
 import { handleFallback } from '../fallback/handler.js';
 import type { RoutingContext } from '../routing/routingStrategy.js';
 import { uiTelemetryService } from '../telemetry/uiTelemetry.js';
+import { runInNewSpan } from 'genkit/tracing';
 
 export function isThinkingSupported(model: string) {
   return model.startsWith('gemini-2.5') || model === DEFAULT_GEMINI_MODEL_AUTO;
@@ -480,182 +481,216 @@ My setup is complete. I will provide my first command in the next turn.
     turns: number = MAX_TURNS,
     isInvalidStreamRetry: boolean = false,
   ): AsyncGenerator<ServerGeminiStreamEvent, Turn> {
-    if (this.lastPromptId !== prompt_id) {
-      this.loopDetector.reset(prompt_id);
-      this.lastPromptId = prompt_id;
-      this.currentSequenceModel = null;
-    }
-    this.sessionTurnCount++;
-    if (
-      this.config.getMaxSessionTurns() > 0 &&
-      this.sessionTurnCount > this.config.getMaxSessionTurns()
-    ) {
-      yield { type: GeminiEventType.MaxSessionTurns };
-      return new Turn(this.getChat(), prompt_id);
-    }
-    // Ensure turns never exceeds MAX_TURNS to prevent infinite loops
-    const boundedTurns = Math.min(turns, MAX_TURNS);
-    if (!boundedTurns) {
-      return new Turn(this.getChat(), prompt_id);
-    }
-
-    // Check for context window overflow
-    const modelForLimitCheck = this._getEffectiveModelForCurrentTurn();
-
-    const estimatedRequestTokenCount = Math.floor(
-      JSON.stringify(request).length / 4,
-    );
-
-    const remainingTokenCount =
-      tokenLimit(modelForLimitCheck) -
-      uiTelemetryService.getLastPromptTokenCount();
-
-    if (estimatedRequestTokenCount > remainingTokenCount * 0.95) {
-      yield {
-        type: GeminiEventType.ContextWindowWillOverflow,
-        value: { estimatedRequestTokenCount, remainingTokenCount },
-      };
-      return new Turn(this.getChat(), prompt_id);
-    }
-
-    const compressed = await this.tryCompressChat(prompt_id, false);
-
-    if (compressed.compressionStatus === CompressionStatus.COMPRESSED) {
-      yield { type: GeminiEventType.ChatCompressed, value: compressed };
-    }
-
-    // Prevent context updates from being sent while a tool call is
-    // waiting for a response. The Gemini API requires that a functionResponse
-    // part from the user immediately follows a functionCall part from the model
-    // in the conversation history . The IDE context is not discarded; it will
-    // be included in the next regular message sent to the model.
-    const history = this.getHistory();
-    const lastMessage =
-      history.length > 0 ? history[history.length - 1] : undefined;
-    const hasPendingToolCall =
-      !!lastMessage &&
-      lastMessage.role === 'model' &&
-      (lastMessage.parts?.some((p) => 'functionCall' in p) || false);
-
-    if (this.config.getIdeMode() && !hasPendingToolCall) {
-      const { contextParts, newIdeContext } = this.getIdeContextParts(
-        this.forceFullIdeContext || history.length === 0,
-      );
-      if (contextParts.length > 0) {
-        this.getChat().addHistory({
-          role: 'user',
-          parts: [{ text: contextParts.join('\n') }],
-        });
+    const traceInputData = { request };
+    const traceOutputData = { chunks: [] as ServerGeminiStreamEvent[] };
+    const self = this;
+    async function* genFn(): AsyncGenerator<ServerGeminiStreamEvent, Turn> {
+      if (self.lastPromptId !== prompt_id) {
+        self.loopDetector.reset(prompt_id);
+        self.lastPromptId = prompt_id;
+        self.currentSequenceModel = null;
       }
-      this.lastSentIdeContext = newIdeContext;
-      this.forceFullIdeContext = false;
-    }
+      self.sessionTurnCount++;
+      if (
+        self.config.getMaxSessionTurns() > 0 &&
+        self.sessionTurnCount > self.config.getMaxSessionTurns()
+      ) {
+        yield { type: GeminiEventType.MaxSessionTurns };
+        return new Turn(self.getChat(), prompt_id);
+      }
+      // Ensure turns never exceeds MAX_TURNS to prevent infinite loops
+      const boundedTurns = Math.min(turns, MAX_TURNS);
+      if (!boundedTurns) {
+        return new Turn(self.getChat(), prompt_id);
+      }
 
-    const turn = new Turn(this.getChat(), prompt_id);
+      // Check for context window overflow
+      const modelForLimitCheck = self._getEffectiveModelForCurrentTurn();
 
-    const controller = new AbortController();
-    const linkedSignal = AbortSignal.any([signal, controller.signal]);
+      const estimatedRequestTokenCount = Math.floor(
+        JSON.stringify(request).length / 4,
+      );
 
-    const loopDetected = await this.loopDetector.turnStarted(signal);
-    if (loopDetected) {
-      yield { type: GeminiEventType.LoopDetected };
-      return turn;
-    }
+      const remainingTokenCount =
+        tokenLimit(modelForLimitCheck) -
+        uiTelemetryService.getLastPromptTokenCount();
 
-    const routingContext: RoutingContext = {
-      history: this.getChat().getHistory(/*curated=*/ true),
-      request,
-      signal,
-    };
+      if (estimatedRequestTokenCount > remainingTokenCount * 0.95) {
+        yield {
+          type: GeminiEventType.ContextWindowWillOverflow,
+          value: { estimatedRequestTokenCount, remainingTokenCount },
+        };
+        return new Turn(self.getChat(), prompt_id);
+      }
 
-    let modelToUse: string;
+      const compressed = await self.tryCompressChat(prompt_id, false);
 
-    // Determine Model (Stickiness vs. Routing)
-    if (this.currentSequenceModel) {
-      modelToUse = this.currentSequenceModel;
-    } else {
-      const router = await this.config.getModelRouterService();
-      const decision = await router.route(routingContext);
-      modelToUse = decision.model;
-      // Lock the model for the rest of the sequence
-      this.currentSequenceModel = modelToUse;
-    }
+      if (compressed.compressionStatus === CompressionStatus.COMPRESSED) {
+        yield { type: GeminiEventType.ChatCompressed, value: compressed };
+      }
 
-    const resultStream = turn.run(modelToUse, request, linkedSignal);
-    for await (const event of resultStream) {
-      if (this.loopDetector.addAndCheck(event)) {
+      // Prevent context updates from being sent while a tool call is
+      // waiting for a response. The Gemini API requires that a functionResponse
+      // part from the user immediately follows a functionCall part from the model
+      // in the conversation history . The IDE context is not discarded; it will
+      // be included in the next regular message sent to the model.
+      const history = self.getHistory();
+      const lastMessage =
+        history.length > 0 ? history[history.length - 1] : undefined;
+      const hasPendingToolCall =
+        !!lastMessage &&
+        lastMessage.role === 'model' &&
+        (lastMessage.parts?.some((p) => 'functionCall' in p) || false);
+
+      if (self.config.getIdeMode() && !hasPendingToolCall) {
+        const { contextParts, newIdeContext } = self.getIdeContextParts(
+          self.forceFullIdeContext || history.length === 0,
+        );
+        if (contextParts.length > 0) {
+          self.getChat().addHistory({
+            role: 'user',
+            parts: [{ text: contextParts.join('\n') }],
+          });
+        }
+        self.lastSentIdeContext = newIdeContext;
+        self.forceFullIdeContext = false;
+      }
+
+      const turn = new Turn(self.getChat(), prompt_id);
+
+      const controller = new AbortController();
+      const linkedSignal = AbortSignal.any([signal, controller.signal]);
+
+      const loopDetected = await self.loopDetector.turnStarted(signal);
+      if (loopDetected) {
         yield { type: GeminiEventType.LoopDetected };
-        controller.abort();
         return turn;
       }
-      yield event;
-      if (event.type === GeminiEventType.InvalidStream) {
-        if (this.config.getContinueOnFailedApiCall()) {
-          if (isInvalidStreamRetry) {
-            // We already retried once, so stop here.
-            logContentRetryFailure(
-              this.config,
-              new ContentRetryFailureEvent(
-                4, // 2 initial + 2 after injections
-                'FAILED_AFTER_PROMPT_INJECTION',
-                modelToUse,
-              ),
+
+      const routingContext: RoutingContext = {
+        history: self.getChat().getHistory(/*curated=*/ true),
+        request,
+        signal,
+      };
+
+      let modelToUse: string;
+
+      // Determine Model (Stickiness vs. Routing)
+      if (self.currentSequenceModel) {
+        modelToUse = self.currentSequenceModel;
+      } else {
+        const router = await self.config.getModelRouterService();
+        const decision = await router.route(routingContext);
+        modelToUse = decision.model;
+        // Lock the model for the rest of the sequence
+        self.currentSequenceModel = modelToUse;
+      }
+
+      const resultStream = turn.run(modelToUse, request, linkedSignal);
+      for await (const event of resultStream) {
+        if (self.loopDetector.addAndCheck(event)) {
+          yield { type: GeminiEventType.LoopDetected };
+          controller.abort();
+          return turn;
+        }
+        yield event;
+        if (event.type === GeminiEventType.InvalidStream) {
+          if (self.config.getContinueOnFailedApiCall()) {
+            if (isInvalidStreamRetry) {
+              // We already retried once, so stop here.
+              logContentRetryFailure(
+                self.config,
+                new ContentRetryFailureEvent(
+                  4, // 2 initial + 2 after injections
+                  'FAILED_AFTER_PROMPT_INJECTION',
+                  modelToUse,
+                ),
+              );
+              return turn;
+            }
+            const nextRequest = [{ text: 'System: Please continue.' }];
+            yield* self.sendMessageStream(
+              nextRequest,
+              signal,
+              prompt_id,
+              boundedTurns - 1,
+              true, // Set isInvalidStreamRetry to true
             );
             return turn;
           }
-          const nextRequest = [{ text: 'System: Please continue.' }];
-          yield* this.sendMessageStream(
+        }
+        if (event.type === GeminiEventType.Error) {
+          return turn;
+        }
+      }
+      if (!turn.pendingToolCalls.length && signal && !signal.aborted) {
+        // Check if next speaker check is needed
+        if (self.config.getQuotaErrorOccurred()) {
+          return turn;
+        }
+
+        if (self.config.getSkipNextSpeakerCheck()) {
+          return turn;
+        }
+
+        const nextSpeakerCheck = await checkNextSpeaker(
+          self.getChat(),
+          self.config.getBaseLlmClient(),
+          signal,
+          prompt_id,
+        );
+        logNextSpeakerCheck(
+          self.config,
+          new NextSpeakerCheckEvent(
+            prompt_id,
+            turn.finishReason?.toString() || '',
+            nextSpeakerCheck?.next_speaker || '',
+          ),
+        );
+        if (nextSpeakerCheck?.next_speaker === 'model') {
+          const nextRequest = [{ text: 'Please continue.' }];
+          // This recursive call's events will be yielded out, but the final
+          // turn object will be from the top-level call.
+          yield* self.sendMessageStream(
             nextRequest,
             signal,
             prompt_id,
             boundedTurns - 1,
-            true, // Set isInvalidStreamRetry to true
+            // isInvalidStreamRetry is false here, as this is a next speaker check
           );
-          return turn;
         }
       }
-      if (event.type === GeminiEventType.Error) {
-        return turn;
-      }
+      return turn;
     }
-    if (!turn.pendingToolCalls.length && signal && !signal.aborted) {
-      // Check if next speaker check is needed
-      if (this.config.getQuotaErrorOccurred()) {
-        return turn;
+    let res: AsyncGenerator<ServerGeminiStreamEvent, Turn>;
+    let doneCompleter;
+    const donePromise = new Promise((_completer) => {
+      doneCompleter = _completer;
+    });
+    let startCompleter;
+    const startPromise = new Promise((_completer) => {
+      startCompleter = _completer;
+    });
+    runInNewSpan({ metadata: { name: 'sendMessageStream' } }, async (meta) => {
+      meta.input = traceInputData;
+      meta.output = traceOutputData;
+      res = genFn();
+      startCompleter!(undefined);
+      await donePromise;
+    });
+    await startPromise;
+    try {
+      while (true) {
+        const { value, done } = await res!.next();
+        if (done) {
+          return value as Turn; // Capture the return value when done is true
+        }
+        traceOutputData.chunks.push(value);
+        yield value;
       }
-
-      if (this.config.getSkipNextSpeakerCheck()) {
-        return turn;
-      }
-
-      const nextSpeakerCheck = await checkNextSpeaker(
-        this.getChat(),
-        this.config.getBaseLlmClient(),
-        signal,
-        prompt_id,
-      );
-      logNextSpeakerCheck(
-        this.config,
-        new NextSpeakerCheckEvent(
-          prompt_id,
-          turn.finishReason?.toString() || '',
-          nextSpeakerCheck?.next_speaker || '',
-        ),
-      );
-      if (nextSpeakerCheck?.next_speaker === 'model') {
-        const nextRequest = [{ text: 'Please continue.' }];
-        // This recursive call's events will be yielded out, but the final
-        // turn object will be from the top-level call.
-        yield* this.sendMessageStream(
-          nextRequest,
-          signal,
-          prompt_id,
-          boundedTurns - 1,
-          // isInvalidStreamRetry is false here, as this is a next speaker check
-        );
-      }
+    } finally {
+      doneCompleter!(undefined);
     }
-    return turn;
   }
 
   async generateContent(
@@ -664,68 +699,81 @@ My setup is complete. I will provide my first command in the next turn.
     abortSignal: AbortSignal,
     model: string,
   ): Promise<GenerateContentResponse> {
-    let currentAttemptModel: string = model;
+    return runInNewSpan(
+      { metadata: { name: 'sendMessageStream' } },
+      async (meta) => {
+        let currentAttemptModel: string = model;
 
-    const configToUse: GenerateContentConfig = {
-      ...this.generateContentConfig,
-      ...generationConfig,
-    };
+        const configToUse: GenerateContentConfig = {
+          ...this.generateContentConfig,
+          ...generationConfig,
+        };
 
-    try {
-      const userMemory = this.config.getUserMemory();
-      const systemInstruction = getCoreSystemPrompt(this.config, userMemory);
+        try {
+          const userMemory = this.config.getUserMemory();
+          const systemInstruction = getCoreSystemPrompt(
+            this.config,
+            userMemory,
+          );
 
-      const requestConfig: GenerateContentConfig = {
-        abortSignal,
-        ...configToUse,
-        systemInstruction,
-      };
+          const requestConfig: GenerateContentConfig = {
+            abortSignal,
+            ...configToUse,
+            systemInstruction,
+          };
 
-      const apiCall = () => {
-        const modelToUse = this.config.isInFallbackMode()
-          ? DEFAULT_GEMINI_FLASH_MODEL
-          : model;
-        currentAttemptModel = modelToUse;
+          const apiCall = () => {
+            const modelToUse = this.config.isInFallbackMode()
+              ? DEFAULT_GEMINI_FLASH_MODEL
+              : model;
+            currentAttemptModel = modelToUse;
 
-        return this.getContentGeneratorOrFail().generateContent(
-          {
-            model: modelToUse,
-            config: requestConfig,
-            contents,
-          },
-          this.lastPromptId,
-        );
-      };
-      const onPersistent429Callback = async (
-        authType?: string,
-        error?: unknown,
-      ) =>
-        // Pass the captured model to the centralized handler.
-        await handleFallback(this.config, currentAttemptModel, authType, error);
+            return this.getContentGeneratorOrFail().generateContent(
+              {
+                model: modelToUse,
+                config: requestConfig,
+                contents,
+              },
+              this.lastPromptId,
+            );
+          };
+          const onPersistent429Callback = async (
+            authType?: string,
+            error?: unknown,
+          ) =>
+            // Pass the captured model to the centralized handler.
+            await handleFallback(
+              this.config,
+              currentAttemptModel,
+              authType,
+              error,
+            );
 
-      const result = await retryWithBackoff(apiCall, {
-        onPersistent429: onPersistent429Callback,
-        authType: this.config.getContentGeneratorConfig()?.authType,
-      });
-      return result;
-    } catch (error: unknown) {
-      if (abortSignal.aborted) {
-        throw error;
-      }
+          const result = await retryWithBackoff(apiCall, {
+            onPersistent429: onPersistent429Callback,
+            authType: this.config.getContentGeneratorConfig()?.authType,
+          });
+          return result;
+        } catch (error: unknown) {
+          if (abortSignal.aborted) {
+            throw error;
+          }
 
-      await reportError(
-        error,
-        `Error generating content via API with model ${currentAttemptModel}.`,
-        {
-          requestContents: contents,
-          requestConfig: configToUse,
-        },
-        'generateContent-api',
-      );
-      throw new Error(
-        `Failed to generate content with model ${currentAttemptModel}: ${getErrorMessage(error)}`,
-      );
-    }
+          await reportError(
+            error,
+            `Error generating content via API with model ${currentAttemptModel}.`,
+            {
+              requestContents: contents,
+              requestConfig: configToUse,
+            },
+            'generateContent-api',
+          );
+          throw new Error(
+            `Failed to generate content with model ${currentAttemptModel}: ${getErrorMessage(error)}`,
+          );
+        }
+      },
+    );
   }
 
   async tryCompressChat(

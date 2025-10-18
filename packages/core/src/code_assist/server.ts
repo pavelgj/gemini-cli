@@ -35,6 +35,7 @@ import {
   toCountTokenRequest,
   toGenerateContentRequest,
 } from './converter.js';
+import { runInNewSpan } from 'genkit/tracing';
 
 /** HTTP options to be used in each of the requests. */
 export interface HttpOptions {
@@ -58,21 +59,29 @@ export class CodeAssistServer implements ContentGenerator {
     req: GenerateContentParameters,
     userPromptId: string,
   ): Promise<AsyncGenerator<GenerateContentResponse>> {
-    const resps = await this.requestStreamingPost<CaGenerateContentResponse>(
-      'streamGenerateContent',
-      toGenerateContentRequest(
-        req,
-        userPromptId,
-        this.projectId,
-        this.sessionId,
-      ),
-      req.config?.abortSignal,
+    return runInNewSpan(
+      { metadata: { name: 'CodeAssistServer_generateContentStream' } },
+      async (meta) => {
+        const request = toGenerateContentRequest(
+          req,
+          userPromptId,
+          this.projectId,
+          this.sessionId,
+        );
+        meta.input = request;
+        const resps =
+          await this.requestStreamingPost<CaGenerateContentResponse>(
+            'streamGenerateContent',
+            request,
+            req.config?.abortSignal,
+          );
+        return (async function* (): AsyncGenerator<GenerateContentResponse> {
+          for await (const resp of resps) {
+            yield fromGenerateContentResponse(resp);
+          }
+        })();
+      },
     );
-    return (async function* (): AsyncGenerator<GenerateContentResponse> {
-      for await (const resp of resps) {
-        yield fromGenerateContentResponse(resp);
-      }
-    })();
   }
 
   async generateContent(

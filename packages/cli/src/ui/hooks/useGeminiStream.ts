@@ -64,6 +64,7 @@ import path from 'node:path';
 import { useSessionStats } from '../contexts/SessionContext.js';
 import { useKeypress } from './useKeypress.js';
 import type { LoadedSettings } from '../../config/settings.js';
+import { runInNewSpan } from 'genkit/tracing';
 
 enum StreamProcessingStatus {
   Completed,
@@ -793,107 +794,123 @@ export const useGeminiStream = (
       options?: { isContinuation: boolean },
       prompt_id?: string,
     ) => {
-      if (
-        (streamingState === StreamingState.Responding ||
-          streamingState === StreamingState.WaitingForConfirmation) &&
-        !options?.isContinuation
-      )
-        return;
-
-      const userMessageTimestamp = Date.now();
-
-      // Reset quota error flag when starting a new query (not a continuation)
-      if (!options?.isContinuation) {
-        setModelSwitchedFromQuotaError(false);
-        config.setQuotaErrorOccurred(false);
-      }
-
-      abortControllerRef.current = new AbortController();
-      const abortSignal = abortControllerRef.current.signal;
-      turnCancelledRef.current = false;
-
-      if (!prompt_id) {
-        prompt_id = config.getSessionId() + '########' + getPromptCount();
-      }
-      return promptIdContext.run(prompt_id, async () => {
-        const { queryToSend, shouldProceed } = await prepareQueryForGemini(
-          query,
-          userMessageTimestamp,
-          abortSignal,
-          prompt_id,
-        );
-
-        if (!shouldProceed || queryToSend === null) {
-          return;
-        }
-
-        if (!options?.isContinuation) {
-          if (typeof queryToSend === 'string') {
-            // logging the text prompts only for now
-            const promptText = queryToSend;
-            logUserPrompt(
-              config,
-              new UserPromptEvent(
-                promptText.length,
-                prompt_id,
-                config.getContentGeneratorConfig()?.authType,
-                promptText,
-              ),
-            );
-          }
-          startNewPrompt();
-          setThought(null); // Reset thought when starting a new prompt
-        }
-
-        setIsResponding(true);
-        setInitError(null);
-
-        try {
-          const stream = geminiClient.sendMessageStream(
-            queryToSend,
-            abortSignal,
-            prompt_id,
-          );
-          const processingStatus = await processGeminiStreamEvents(
-            stream,
-            userMessageTimestamp,
-            abortSignal,
-          );
-
-          if (processingStatus === StreamProcessingStatus.UserCancelled) {
+      return runInNewSpan(
+        {
+          metadata: {
+            name: 'geminiStream_submitQuery',
+            metadata: { 'subtype': 'custom-trace' },
+          },
+        },
+        async (genkitMetadata) => {
+          if (
+            (streamingState === StreamingState.Responding ||
+              streamingState === StreamingState.WaitingForConfirmation) &&
+            !options?.isContinuation
+          )
             return;
+
+          const userMessageTimestamp = Date.now();
+
+          // Reset quota error flag when starting a new query (not a continuation)
+          if (!options?.isContinuation) {
+            setModelSwitchedFromQuotaError(false);
+            config.setQuotaErrorOccurred(false);
           }
 
-          if (pendingHistoryItemRef.current) {
-            addItem(pendingHistoryItemRef.current, userMessageTimestamp);
-            setPendingHistoryItem(null);
+          abortControllerRef.current = new AbortController();
+          const abortSignal = abortControllerRef.current.signal;
+          turnCancelledRef.current = false;
+
+          if (!prompt_id) {
+            prompt_id = config.getSessionId() + '########' + getPromptCount();
           }
-          if (loopDetectedRef.current) {
-            loopDetectedRef.current = false;
-            handleLoopDetectedEvent();
-          }
-        } catch (error: unknown) {
-          if (error instanceof UnauthorizedError) {
-            onAuthError('Session expired or is unauthorized.');
-          } else if (!isNodeError(error) || error.name !== 'AbortError') {
-            addItem(
-              {
-                type: MessageType.ERROR,
-                text: parseAndFormatApiError(
-                  getErrorMessage(error) || 'Unknown error',
-                  config.getContentGeneratorConfig()?.authType,
-                  undefined,
-                  config.getModel(),
-                  DEFAULT_GEMINI_FLASH_MODEL,
-                ),
-              },
+          return promptIdContext.run(prompt_id, async () => {
+            const { queryToSend, shouldProceed } = await prepareQueryForGemini(
+              query,
               userMessageTimestamp,
+              abortSignal,
+              prompt_id!,
             );
-          }
-        } finally {
-          setIsResponding(false);
-        }
-      });
+            genkitMetadata.input = {
+              query,
+              prompt_id,
+              queryToSend,
+              shouldProceed,
+            };
+
+            if (!shouldProceed || queryToSend === null) {
+              return;
+            }
+
+            if (!options?.isContinuation) {
+              if (typeof queryToSend === 'string') {
+                // logging the text prompts only for now
+                const promptText = queryToSend;
+                logUserPrompt(
+                  config,
+                  new UserPromptEvent(
+                    promptText.length,
+                    prompt_id!,
+                    config.getContentGeneratorConfig()?.authType,
+                    promptText,
+                  ),
+                );
+              }
+              startNewPrompt();
+              setThought(null); // Reset thought when starting a new prompt
+            }
+
+            setIsResponding(true);
+            setInitError(null);
+
+            try {
+              const stream = geminiClient.sendMessageStream(
+                queryToSend,
+                abortSignal,
+                prompt_id!,
+              );
+              const processingStatus = await processGeminiStreamEvents(
+                stream,
+                userMessageTimestamp,
+                abortSignal,
+              );
+
+              if (processingStatus === StreamProcessingStatus.UserCancelled) {
+                return;
+              }
+
+              if (pendingHistoryItemRef.current) {
+                addItem(pendingHistoryItemRef.current, userMessageTimestamp);
+                setPendingHistoryItem(null);
+              }
+              if (loopDetectedRef.current) {
+                loopDetectedRef.current = false;
+                handleLoopDetectedEvent();
+              }
+            } catch (error: unknown) {
+              if (error instanceof UnauthorizedError) {
+                onAuthError('Session expired or is unauthorized.');
+              } else if (!isNodeError(error) || error.name !== 'AbortError') {
+                addItem(
+                  {
+                    type: MessageType.ERROR,
+                    text: parseAndFormatApiError(
+                      getErrorMessage(error) || 'Unknown error',
+                      config.getContentGeneratorConfig()?.authType,
+                      undefined,
+                      config.getModel(),
+                      DEFAULT_GEMINI_FLASH_MODEL,
+                    ),
+                  },
+                  userMessageTimestamp,
+                );
+              }
+            } finally {
+              setIsResponding(false);
+            }
+          });
+        },
+      );
     },
     [
       streamingState,

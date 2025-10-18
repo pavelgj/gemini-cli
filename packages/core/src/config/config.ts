@@ -157,6 +157,7 @@ import {
   DEFAULT_FILE_FILTERING_OPTIONS,
   DEFAULT_MEMORY_FILE_FILTERING_OPTIONS,
 } from './constants.js';
+import { initializeGenkitTelemetry } from '../telemetry/sdk.js';
 
 export type { FileFilteringOptions };
 export {
@@ -497,6 +498,9 @@ export class Config {
       setGeminiMdFilename(params.contextFileName);
     }
 
+    if (process.env['GENKIT_TELEMETRY'] === 'true') {
+      initializeGenkitTelemetry();
+    }
     if (this.telemetrySettings.enabled) {
       initializeTelemetry(this);
     }

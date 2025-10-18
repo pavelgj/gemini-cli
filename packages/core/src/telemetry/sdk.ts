@@ -43,6 +43,20 @@ import {
   GcpLogExporter,
 } from './gcp-exporters.js';
 import { TelemetryTarget } from './index.js';
+import { disableOTelRootSpanDetection, enableTelemetry } from 'genkit/tracing';
+import { type Genkit, genkit } from 'genkit';
+
+export function getGenkitInstance(): Genkit | undefined {
+  if (process.env['GENKIT_TELEMETRY'] !== 'true') {
+    return undefined;
+  }
+  if ((globalThis as any)['__genkitInstance']) {
+    return (globalThis as any)['__genkitInstance'] as Genkit;
+  }
+  const instance = genkit({});
+  (globalThis as any)['__genkitInstance'] = instance;
+  return instance;
+}
 
 // For troubleshooting, set the log level to DiagLogLevel.DEBUG
 diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.INFO);
@@ -77,6 +91,11 @@ function parseOtlpEndpoint(
     diag.error('Invalid OTLP endpoint URL provided:', trimmedEndpoint, error);
     return undefined;
   }
+}
+
+export function initializeGenkitTelemetry(): void {
+  disableOTelRootSpanDetection();
+  enableTelemetry({});
 }
 
 export function initializeTelemetry(config: Config): void {

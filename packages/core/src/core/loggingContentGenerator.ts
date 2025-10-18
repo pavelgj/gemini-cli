@@ -28,6 +28,7 @@ import {
 import type { ContentGenerator } from './contentGenerator.js';
 import { toContents } from '../code_assist/converter.js';
 import { isStructuredError } from '../utils/quotaErrorDetection.js';
+import { runInNewSpan } from 'genkit/tracing';
 
 interface StructuredError {
   status: number;
@@ -131,23 +132,29 @@ export class LoggingContentGenerator implements ContentGenerator {
     req: GenerateContentParameters,
     userPromptId: string,
   ): Promise<AsyncGenerator<GenerateContentResponse>> {
-    const startTime = Date.now();
-    this.logApiRequest(toContents(req.contents), req.model, userPromptId);
+    return runInNewSpan(
+      { metadata: { name: 'generateContentStream' } },
+      async (meta) => {
+        meta.input = { req, userPromptId };
+        const startTime = Date.now();
+        this.logApiRequest(toContents(req.contents), req.model, userPromptId);
 
-    let stream: AsyncGenerator<GenerateContentResponse>;
-    try {
-      stream = await this.wrapped.generateContentStream(req, userPromptId);
-    } catch (error) {
-      const durationMs = Date.now() - startTime;
-      this._logApiError(durationMs, error, req.model, userPromptId);
-      throw error;
-    }
+        let stream: AsyncGenerator<GenerateContentResponse>;
+        try {
+          stream = await this.wrapped.generateContentStream(req, userPromptId);
+        } catch (error) {
+          const durationMs = Date.now() - startTime;
+          this._logApiError(durationMs, error, req.model, userPromptId);
+          throw error;
+        }
 
-    return this.loggingStreamWrapper(
-      stream,
-      startTime,
-      userPromptId,
-      req.model,
+        return this.loggingStreamWrapper(
+          stream,
+          startTime,
+          userPromptId,
+          req.model,
+        );
+      },
     );
   }
 

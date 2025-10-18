@@ -87,6 +87,9 @@
     "typescript": "^5.3.3",
     "vitest": "^3.1.1"
   },
+  "peerDependencies": {
+    "genkit": "^1.21.0"
+  },
   "engines": {
     "node": ">=20"
   }
